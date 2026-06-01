@@ -5,9 +5,11 @@
       class="surface-svg"
       role="img"
       aria-label="Adaptive Desired Retention distribution surface"
+      @dblclick="resetView"
       @mousemove="handleMouseMove"
       @mouseleave="hideTooltip"
     ></svg>
+    <button class="view-reset" type="button" @click="resetView">Reset view</button>
     <div
       v-if="tooltip.visible"
       class="tooltip"
@@ -43,6 +45,7 @@ const props = defineProps<{
 interface ProjectedPoint {
   x: number;
   y: number;
+  depth: number;
 }
 
 interface PlotPoint extends ProjectedPoint {
@@ -71,6 +74,14 @@ interface TooltipState {
   interval: string;
 }
 
+type Projection = (x: number, y: number, z: number) => ProjectedPoint;
+
+const DEFAULT_YAW = 0;
+const DEFAULT_PITCH = 0;
+const STABILITY_LOG_MIN = -1;
+const STABILITY_LOG_MAX = 4;
+const STABILITY_TICKS = [0.1, 1, 10, 100, 1000, 10000] as const;
+
 const containerEl = ref<HTMLDivElement | null>(null);
 const svgEl = ref<SVGSVGElement | null>(null);
 const plotWidth = ref(0);
@@ -88,6 +99,11 @@ const tooltip = ref<TooltipState>({
 let resizeObserver: ResizeObserver | null = null;
 let hoverPoints: PlotPoint[] = [];
 let delaunay: d3.Delaunay<PlotPoint> | null = null;
+let yaw = DEFAULT_YAW;
+let pitch = DEFAULT_PITCH;
+let isDragging = false;
+let lastDragX = 0;
+let lastDragY = 0;
 
 const policySignature = computed(() =>
   [
@@ -147,9 +163,7 @@ function draw(): void {
   const project = createProjection(width, height);
   const columns = 61;
   const rows = 61;
-  const stabilityLogMin = -1;
-  const stabilityLogMax = 3;
-  const stabilityLogSpan = stabilityLogMax - stabilityLogMin;
+  const stabilityLogSpan = STABILITY_LOG_MAX - STABILITY_LOG_MIN;
   const retentionSpan = props.policy.retentionMax - props.policy.retentionMin;
   const grid: PlotPoint[][] = [];
 
@@ -159,7 +173,7 @@ function draw(): void {
     const line: PlotPoint[] = [];
     for (let column = 0; column < columns; column += 1) {
       const xNorm = column / (columns - 1);
-      const stability = 10 ** (stabilityLogMin + xNorm * stabilityLogSpan);
+      const stability = 10 ** (STABILITY_LOG_MIN + xNorm * stabilityLogSpan);
       const retention = evaluateRetention(props.policy, stability, difficulty, props.costWeight);
       const zNorm = (retention - props.policy.retentionMin) / retentionSpan;
       const projected = project(xNorm, yNorm, zNorm);
@@ -189,6 +203,7 @@ function draw(): void {
   drawContours(svg, grid, project);
   drawAxes(svg, project, props.policy);
   drawLegend(svg, width, props.policy);
+  installDrag(svg);
 }
 
 function drawSurface(
@@ -206,7 +221,7 @@ function drawSurface(
       ];
       cells.push({
         points,
-        depth: row + column,
+        depth: d3.mean(points, (point) => point.depth) ?? 0,
         zNorm: d3.mean(points, (point) => point.zNorm) ?? 0,
       });
     }
@@ -250,7 +265,7 @@ function drawGrid(
 function drawContours(
   svg: d3.Selection<SVGSVGElement, unknown, null, undefined>,
   grid: PlotPoint[][],
-  project: (x: number, y: number, z: number) => ProjectedPoint,
+  project: Projection,
 ): void {
   const segments = contourSegments(grid, contourLevels(), project);
 
@@ -273,7 +288,7 @@ function drawContours(
 
 function drawAxes(
   svg: d3.Selection<SVGSVGElement, unknown, null, undefined>,
-  project: (x: number, y: number, z: number) => ProjectedPoint,
+  project: Projection,
   policy: CostAdrPolicy,
 ): void {
   const axis = svg.append("g").attr("class", "axes");
@@ -282,8 +297,8 @@ function drawAxes(
   drawAxisLine(axis, origin, project(0, 1.05, 0));
   drawAxisLine(axis, origin, project(0, 0, 1.08));
 
-  for (const stability of [0.1, 1, 10, 100, 1000]) {
-    const xNorm = (Math.log10(stability) + 1) / 4;
+  for (const stability of STABILITY_TICKS) {
+    const xNorm = (Math.log10(stability) - STABILITY_LOG_MIN) / (STABILITY_LOG_MAX - STABILITY_LOG_MIN);
     const point = project(xNorm, 0, 0);
     const atOrigin = stability === 0.1;
     drawTick(
@@ -369,7 +384,7 @@ function drawLegend(
 }
 
 function handleMouseMove(event: MouseEvent): void {
-  if (!svgEl.value || !delaunay || hoverPoints.length === 0) return;
+  if (isDragging || !svgEl.value || !delaunay || hoverPoints.length === 0) return;
   const rect = svgEl.value.getBoundingClientRect();
   const viewX = ((event.clientX - rect.left) / rect.width) * plotWidth.value;
   const viewY = ((event.clientY - rect.top) / rect.height) * plotHeight.value;
@@ -396,7 +411,37 @@ function hideTooltip(): void {
   tooltip.value.visible = false;
 }
 
-function createProjection(width: number, height: number) {
+function resetView(): void {
+  yaw = DEFAULT_YAW;
+  pitch = DEFAULT_PITCH;
+  hideTooltip();
+  draw();
+}
+
+function installDrag(svg: d3.Selection<SVGSVGElement, unknown, null, undefined>): void {
+  svg.call(
+    d3
+      .drag<SVGSVGElement, unknown>()
+      .on("start", (event) => {
+        isDragging = true;
+        lastDragX = event.x;
+        lastDragY = event.y;
+        hideTooltip();
+      })
+      .on("drag", (event) => {
+        yaw += (event.x - lastDragX) * 0.45;
+        pitch = clampValue(pitch - (event.y - lastDragY) * 0.35, -70, 70);
+        lastDragX = event.x;
+        lastDragY = event.y;
+        draw();
+      })
+      .on("end", () => {
+        isDragging = false;
+      }),
+  );
+}
+
+function createProjection(width: number, height: number): Projection {
   const scale = Math.min(width * 0.62, height * 0.68);
   const origin = {
     x: width * 0.16,
@@ -405,20 +450,138 @@ function createProjection(width: number, height: number) {
   const sAxis = {
     x: scale * 0.55,
     y: scale * 0.42,
+    depth: 0,
   };
   const dAxis = {
     x: scale * 0.88,
     y: -scale * 0.28,
+    depth: 0,
   };
   const drAxis = {
     x: 0,
     y: -scale * 0.72,
+    depth: 0,
   };
-
-  return (x: number, y: number, z: number): ProjectedPoint => ({
+  const axisDepths = inferOrthogonalDepths(sAxis, dAxis, drAxis);
+  sAxis.depth = axisDepths.s;
+  dAxis.depth = axisDepths.d;
+  drAxis.depth = axisDepths.dr;
+  const homeProject = (x: number, y: number, z: number): ProjectedPoint => ({
     x: origin.x + x * sAxis.x + y * dAxis.x + z * drAxis.x,
     y: origin.y + x * sAxis.y + y * dAxis.y + z * drAxis.y,
+    depth: x * sAxis.depth + y * dAxis.depth + z * drAxis.depth,
   });
+  const center = homeProject(0.5, 0.5, 0.5);
+  const rotatedProject = (x: number, y: number, z: number): ProjectedPoint =>
+    rotateFromHomeView(homeProject(x, y, z), center);
+
+  if (isDefaultView()) {
+    return rotatedProject;
+  }
+
+  const fit = fitRotatedProjection(width, height, center, rotatedProject);
+
+  return (x: number, y: number, z: number): ProjectedPoint => {
+    const point = rotatedProject(x, y, z);
+    return {
+      x: center.x + (point.x - center.x) * fit.scale + fit.shiftX,
+      y: center.y + (point.y - center.y) * fit.scale + fit.shiftY,
+      depth: point.depth,
+    };
+  };
+}
+
+function fitRotatedProjection(
+  width: number,
+  height: number,
+  center: ProjectedPoint,
+  project: Projection,
+): { scale: number; shiftX: number; shiftY: number } {
+  const fitPoints: Array<[number, number, number]> = [
+    [0, 0, 0],
+    [1, 0, 0],
+    [0, 1, 0],
+    [1, 1, 0],
+    [0, 0, 1],
+    [1, 0, 1],
+    [0, 1, 1],
+    [1, 1, 1],
+    [1.1, 0, 0],
+    [0, 1.1, 0],
+    [0, 0, 1.15],
+  ].map(([x, y, z]): [number, number, number] => {
+    const point = project(x, y, z);
+    return [center.x + (point.x - center.x), center.y + (point.y - center.y), point.depth];
+  });
+
+  const minX = d3.min(fitPoints, ([x]) => x) ?? 0;
+  const maxX = d3.max(fitPoints, ([x]) => x) ?? width;
+  const minY = d3.min(fitPoints, ([, y]) => y) ?? 0;
+  const maxY = d3.max(fitPoints, ([, y]) => y) ?? height;
+  const leftPadding = Math.min(118, Math.max(72, width * 0.06));
+  const rightPadding = Math.min(92, Math.max(48, width * 0.045));
+  const topPadding = Math.min(96, Math.max(66, height * 0.08));
+  const bottomPadding = Math.min(88, Math.max(50, height * 0.07));
+  const spanX = Math.max(maxX - minX, 0.001);
+  const spanY = Math.max(maxY - minY, 0.001);
+  const scale = Math.min(1, (width - leftPadding - rightPadding) / spanX, (height - topPadding - bottomPadding) / spanY);
+  const scaledPoints = fitPoints.map(([x, y]) => ({
+    x: center.x + (x - center.x) * scale,
+    y: center.y + (y - center.y) * scale,
+  }));
+  const scaledMinX = d3.min(scaledPoints, (point) => point.x) ?? 0;
+  const scaledMaxX = d3.max(scaledPoints, (point) => point.x) ?? width;
+  const scaledMinY = d3.min(scaledPoints, (point) => point.y) ?? 0;
+  const scaledMaxY = d3.max(scaledPoints, (point) => point.y) ?? height;
+
+  return {
+    scale,
+    shiftX: clampShift(leftPadding - scaledMinX, width - rightPadding - scaledMaxX),
+    shiftY: clampShift(topPadding - scaledMinY, height - bottomPadding - scaledMaxY),
+  };
+}
+
+function isDefaultView(): boolean {
+  return Math.abs(yaw - DEFAULT_YAW) < 0.001 && Math.abs(pitch - DEFAULT_PITCH) < 0.001;
+}
+
+function inferOrthogonalDepths(
+  sAxis: ProjectedPoint,
+  dAxis: ProjectedPoint,
+  drAxis: ProjectedPoint,
+): { s: number; d: number; dr: number } {
+  const sDotD = sAxis.x * dAxis.x + sAxis.y * dAxis.y;
+  const sDotDr = sAxis.x * drAxis.x + sAxis.y * drAxis.y;
+  const dDotDr = dAxis.x * drAxis.x + dAxis.y * drAxis.y;
+  const sDepth = Math.sqrt(Math.max(0.001, ((-sDotD) * (-sDotDr)) / -dDotDr));
+
+  return {
+    s: sDepth,
+    d: -sDotD / sDepth,
+    dr: -sDotDr / sDepth,
+  };
+}
+
+function rotateFromHomeView(point: ProjectedPoint, center: ProjectedPoint): ProjectedPoint {
+  const yawRadians = (yaw * Math.PI) / 180;
+  const pitchRadians = (pitch * Math.PI) / 180;
+  const cosYaw = Math.cos(yawRadians);
+  const sinYaw = Math.sin(yawRadians);
+  const cosPitch = Math.cos(pitchRadians);
+  const sinPitch = Math.sin(pitchRadians);
+  const dx = point.x - center.x;
+  const dy = point.y - center.y;
+  const dz = point.depth - center.depth;
+  const yawX = dx * cosYaw + dz * sinYaw;
+  const yawDepth = -dx * sinYaw + dz * cosYaw;
+  const pitchY = dy * cosPitch - yawDepth * sinPitch;
+  const pitchDepth = dy * sinPitch + yawDepth * cosPitch;
+
+  return {
+    x: center.x + yawX,
+    y: center.y + pitchY,
+    depth: center.depth + pitchDepth,
+  };
 }
 
 function linePath(points: ProjectedPoint[]): string {
@@ -436,7 +599,7 @@ function contourLevels(): number[] {
 function contourSegments(
   grid: PlotPoint[][],
   levels: number[],
-  project: (x: number, y: number, z: number) => ProjectedPoint,
+  project: Projection,
 ): ContourSegment[] {
   const segments: ContourSegment[] = [];
   for (let row = 0; row < grid.length - 1; row += 1) {
@@ -459,11 +622,7 @@ function contourSegments(
           segments.push({
             start,
             end,
-            depth:
-              intersections[index].xNorm +
-              intersections[index].yNorm +
-              intersections[index + 1].xNorm +
-              intersections[index + 1].yNorm,
+            depth: (start.depth + end.depth) / 2,
             level,
           });
         }
@@ -495,6 +654,7 @@ function interpolatePoint(start: PlotPoint, end: PlotPoint, t: number, retention
   const projected = {
     x: start.x + (end.x - start.x) * t,
     y: start.y + (end.y - start.y) * t,
+    depth: start.depth + (end.depth - start.depth) * t,
   };
   return {
     ...projected,
@@ -588,6 +748,17 @@ function formatInterval(value: number): string {
 function formatStabilityTick(value: number): string {
   return value < 1 ? value.toFixed(1) : value.toFixed(0);
 }
+
+function clampValue(value: number, min: number, max: number): number {
+  return Math.min(Math.max(value, min), max);
+}
+
+function clampShift(minimumShift: number, maximumShift: number): number {
+  if (minimumShift > maximumShift) return (minimumShift + maximumShift) / 2;
+  if (minimumShift > 0) return minimumShift;
+  if (maximumShift < 0) return maximumShift;
+  return 0;
+}
 </script>
 
 <style scoped>
@@ -606,7 +777,33 @@ function formatStabilityTick(value: number): string {
   display: block;
   width: 100%;
   height: 100%;
-  cursor: crosshair;
+  cursor: grab;
+  touch-action: none;
+}
+
+.surface-svg:active {
+  cursor: grabbing;
+}
+
+.view-reset {
+  position: absolute;
+  right: 0.75rem;
+  bottom: 0.75rem;
+  z-index: 3;
+  padding: 0.4rem 0.65rem;
+  border: 1px solid rgba(255, 255, 255, 0.18);
+  border-radius: 6px;
+  background: rgba(10, 14, 18, 0.74);
+  color: #eef4f8;
+  font: inherit;
+  font-size: 0.82rem;
+  font-weight: 650;
+  cursor: pointer;
+}
+
+.view-reset:hover {
+  border-color: rgba(143, 193, 255, 0.58);
+  background: rgba(18, 30, 42, 0.88);
 }
 
 .tooltip {
