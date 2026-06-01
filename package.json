@@ -1,0 +1,33 @@
+{
+  "name": "cost-adr-visualizer",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "vite --host",
+    "build": "run-p type-check \"build-only {@}\" --",
+    "preview": "vite preview --host",
+    "build-only": "vite build",
+    "test": "vitest run",
+    "type-check": "vue-tsc --build --force"
+  },
+  "dependencies": {
+    "d3": "^7.9.0",
+    "vue": "^3.5.17"
+  },
+  "devDependencies": {
+    "@tsconfig/node20": "^20.1.6",
+    "@types/d3": "^7.4.3",
+    "@types/node": "^24.0.13",
+    "@vitejs/plugin-vue": "^6.0.0",
+    "@vue/tsconfig": "^0.7.0",
+    "npm-run-all2": "^8.0.4",
+    "typescript": "5.8.3",
+    "vite": "^7.0.4",
+    "vitest": "^3.2.4",
+    "vue-tsc": "3.0.1"
+  },
+  "optionalDependencies": {
+    "@rollup/rollup-linux-x64-gnu": "^4.45.0"
+  }
+}
